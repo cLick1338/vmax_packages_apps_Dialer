@@ -23,9 +23,13 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
+import android.media.AudioManager;
+import android.media.AudioRecordingConfiguration;
 import android.media.MediaRecorder;
 import android.net.Uri;
+import android.os.Handler;
 import android.os.IBinder;
+import android.os.Looper;
 import android.os.ParcelFileDescriptor;
 import android.os.RemoteException;
 import android.provider.MediaStore;
@@ -45,7 +49,9 @@ public class CallRecorderService extends Service {
   private static final boolean DBG = false;
 
   private MediaRecorder mMediaRecorder = null;
-  private CallRecording mCurrentRecording = null;
+  private VoipCallRecorder mVoipRecorder = null;
+  private volatile CallRecording mCurrentRecording = null;
+  private final Handler mHandler = new Handler(Looper.getMainLooper());
 
   private final SimpleDateFormat DATE_FORMAT = new SimpleDateFormat("yyMMdd_HHmmssSSS");
 
@@ -62,7 +68,7 @@ public class CallRecorderService extends Service {
 
     @Override
     public boolean isRecording() throws RemoteException {
-      return mMediaRecorder != null;
+      return mCurrentRecording != null;
     }
 
     @Override
@@ -73,6 +79,7 @@ public class CallRecorderService extends Service {
 
   @Override
   public void onCreate() {
+    super.onCreate();
     if (DBG) Log.d(TAG, "Creating CallRecorderService");
   }
 
@@ -105,7 +112,7 @@ public class CallRecorderService extends Service {
   }
 
   private synchronized boolean startRecordingInternal(String phoneNumber, long creationTime) {
-    if (mMediaRecorder != null) {
+    if (mCurrentRecording != null) {
       if (DBG) {
         Log.d(TAG, "Start called with recording in progress, stopping  current recording");
       }
@@ -119,6 +126,11 @@ public class CallRecorderService extends Service {
     }
 
     if (DBG) Log.d(TAG, "Starting recording");
+
+    if (getResources().getBoolean(R.bool.call_recording_software_ims)
+        && getSystemService(AudioManager.class).getMode() == AudioManager.MODE_IN_COMMUNICATION) {
+      return startSoftwareRecording(phoneNumber, creationTime);
+    }
 
     mMediaRecorder = new MediaRecorder(getApplicationContext());
     try {
@@ -143,13 +155,14 @@ public class CallRecorderService extends Service {
             CallRecording.generateMediaInsertValues(fileName, creationTime));
 
     try {
-      ParcelFileDescriptor pfd = getContentResolver().openFileDescriptor(uri, "w");
-      if (pfd == null) {
-        throw new IOException("Opening file for URI " + uri + " failed");
+      try (ParcelFileDescriptor pfd = getContentResolver().openFileDescriptor(uri, "w")) {
+        if (pfd == null) {
+          throw new IOException("Opening file for URI " + uri + " failed");
+        }
+        mMediaRecorder.setOutputFile(pfd.getFileDescriptor());
+        mMediaRecorder.prepare();
+        mMediaRecorder.start();
       }
-      mMediaRecorder.setOutputFile(pfd.getFileDescriptor());
-      mMediaRecorder.prepare();
-      mMediaRecorder.start();
 
       long mediaId = Long.parseLong(uri.getLastPathSegment());
       mCurrentRecording = new CallRecording(phoneNumber, creationTime,
@@ -175,9 +188,54 @@ public class CallRecorderService extends Service {
     return false;
   }
 
+  private boolean startSoftwareRecording(String phoneNumber, long creationTime) {
+    Uri uri = null;
+    VoipCallRecorder recorder = new VoipCallRecorder(this, failed -> mHandler.post(() -> {
+      synchronized (this) {
+        if (mVoipRecorder == failed) stopRecordingInternal();
+      }
+    }));
+    try {
+      AudioManager manager = getSystemService(AudioManager.class);
+      int callUid = -1;
+      for (AudioRecordingConfiguration configuration : manager.getActiveRecordingConfigurations()) {
+        if (configuration.getClientAudioSource() == MediaRecorder.AudioSource.VOICE_COMMUNICATION
+            && !configuration.isClientSilenced()
+            && configuration.getClientUid() != getApplicationInfo().uid) {
+          if (callUid != -1 && callUid != configuration.getClientUid()) {
+            throw new IOException("Cannot identify the software call audio owner");
+          }
+          callUid = configuration.getClientUid();
+        }
+      }
+      if (callUid == -1) throw new IOException("Software call microphone is not active");
+      String fileName = generateFilename(phoneNumber);
+      uri = getContentResolver().insert(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
+          CallRecording.generateMediaInsertValues(fileName, creationTime));
+      if (uri == null) throw new IOException("Cannot create recording");
+      try (ParcelFileDescriptor output = getContentResolver().openFileDescriptor(uri, "w")) {
+        if (output == null) throw new IOException("Cannot open recording");
+        recorder.start(output, getAudioFormatChoice(), callUid);
+      }
+      mVoipRecorder = recorder;
+      mCurrentRecording = new CallRecording(phoneNumber, creationTime, fileName,
+          System.currentTimeMillis(), Long.parseLong(uri.getLastPathSegment()));
+      return true;
+    } catch (IOException | RuntimeException error) {
+      Log.w(TAG, "Could not start software call recording", error);
+      recorder.stop();
+      if (uri != null) getContentResolver().delete(uri, null, null);
+      return false;
+    }
+  }
+
   private synchronized CallRecording stopRecordingInternal() {
     CallRecording recording = mCurrentRecording;
     if (DBG) Log.d(TAG, "Stopping current recording");
+    if (mVoipRecorder != null) {
+      mVoipRecorder.stop();
+      mVoipRecorder = null;
+    }
     if (mMediaRecorder != null) {
       try {
         mMediaRecorder.stop();
@@ -187,11 +245,13 @@ public class CallRecorderService extends Service {
         Log.e(TAG, "Exception closing media recorder", e);
       }
 
+      mMediaRecorder = null;
+    }
+    if (mCurrentRecording != null) {
       Uri uri = ContentUris.withAppendedId(
           MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, mCurrentRecording.mediaId);
       getContentResolver().update(uri, CallRecording.generateCompletedValues(), null, null);
 
-      mMediaRecorder = null;
       mCurrentRecording = null;
     }
     return recording;
@@ -199,6 +259,7 @@ public class CallRecorderService extends Service {
 
   @Override
   public void onDestroy() {
+    stopRecordingInternal();
     super.onDestroy();
     if (DBG) Log.d(TAG, "Destroying CallRecorderService");
   }
